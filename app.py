@@ -7,10 +7,12 @@ This IS the Day 1 working product:
   - "End interview" → triggers scoring
   - Score displayed inline
 """
-
+from interviewsim.report import generate_pdf
 import streamlit as st
+import time
+import streamlit.components.v1 as components
 import sys, os
-sys.path.insert(0, os.path.dirname(__file__))
+# sys.path.insert(0, os.path.dirname(__file__))
 
 from config import DOMAINS, DIFFICULTIES, RUBRIC
 from interviewsim.interviewer import chat_turn, score_interview, get_hint, build_transcript
@@ -35,6 +37,8 @@ def init_state():
         "scores": None,
         "current_question": "",  # tracks last interviewer question for hint
         "hint_shown": False,
+        "question_start_time": None,
+        "last_audio_bytes": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -117,6 +121,66 @@ elif st.session_state.phase == "interview":
 
     st.divider()
 
+    # ── Timer ──────────────────────────────────────────────────────────────────
+    time_per_q = DOMAINS[domain]["time_per_question"] * 60  # convert to seconds
+    start = st.session_state.question_start_time or time.time()
+    elapsed = int(time.time() - start)
+    remaining = max(0, time_per_q - elapsed)
+
+    components.html(f"""
+    <div style="font-family: sans-serif; padding: 8px 4px">
+    <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:8px">
+        <span id="timer-label" style="font-size:13px; color:#888888">⏱ Time remaining</span>
+        <span id="timer-text" style="font-size:24px; font-weight:700; font-variant-numeric:tabular-nums; color:#1D9E75">--:--</span>
+    </div>
+    <div style="background:#dddddd; border-radius:6px; height:8px; width:100%; overflow:hidden">
+        <div id="timer-bar" style="height:100%; border-radius:6px; width:100%; background:#1D9E75; transition: width 1s linear, background 1s linear"></div>
+    </div>
+    </div>
+
+    <script>
+    var remaining = {remaining};
+    var total = {time_per_q};
+
+    function formatTime(s) {{
+        var m = Math.floor(s / 60);
+        var sec = s % 60;
+        return m + ":" + (sec < 10 ? "0" : "") + sec;
+    }}
+
+    function getColor(s) {{
+        var pct = s / total;
+        if (pct > 0.5) return "#1D9E75";
+        if (pct > 0.25) return "#EF9F27";
+        return "#D85A30";
+    }}
+
+    function render() {{
+        var color = getColor(remaining);
+        var pct = Math.round((remaining / total) * 100);
+        document.getElementById("timer-text").innerText = formatTime(remaining);
+        document.getElementById("timer-text").style.color = color;
+        document.getElementById("timer-bar").style.width = pct + "%";
+        document.getElementById("timer-bar").style.background = color;
+        if (remaining <= 0) {{
+        document.getElementById("timer-label").innerText = "⏰ Time's up — wrap up!";
+        document.getElementById("timer-label").style.color = "#D85A30";
+        }}
+    }}
+
+    render();
+
+    if (remaining > 0) {{
+        var interval = setInterval(function() {{
+        remaining--;
+        render();
+        if (remaining <= 0) clearInterval(interval);
+        }}, 1000);
+    }}
+    </script>
+    """, height=90, scrolling=False)
+    
+
     # ── Render existing chat history ──
     for msg in st.session_state.messages:
         role = "assistant" if msg["role"] == "assistant" else "user"
@@ -139,6 +203,7 @@ elif st.session_state.phase == "interview":
         st.session_state.messages.append({"role": "assistant", "content": full_response})
         st.session_state.current_question = full_response
         st.session_state.question_count = 1
+        st.session_state.question_start_time = time.time() 
         st.rerun()
 
     # ── Hint button ──
@@ -149,7 +214,33 @@ elif st.session_state.phase == "interview":
             st.session_state.hint_shown = True
 
     # ── User answer input ──
-    answer = st.chat_input("Type your answer here…")
+    from interviewsim.voice import transcribe
+
+    # ── Input: text or voice ──
+    col_input, col_mic = st.columns([5, 1])
+
+    with col_input:
+        answer = st.chat_input("Type your answer here…")
+
+    with col_mic:
+        audio = st.audio_input("🎙️")
+        submit_voice = st.button("Send 🎤")
+
+    # 🎙️ Voice handling (FIXED)
+    if audio and submit_voice:
+        audio_bytes = audio.read()
+
+        # Only process NEW audio
+        if audio_bytes != st.session_state.last_audio_bytes:
+            st.session_state.last_audio_bytes = audio_bytes
+
+            with st.spinner("Transcribing…"):
+                voice_text = transcribe(audio_bytes)
+
+            if voice_text:
+                st.info(f"🎙️ You said: *{voice_text}*")
+                answer = voice_text
+
     if answer:
         # Display user message
         with st.chat_message("user"):
@@ -180,6 +271,7 @@ elif st.session_state.phase == "interview":
         st.session_state.messages.append({"role": "assistant", "content": full_response})
         st.session_state.current_question = full_response
         st.session_state.question_count += 1
+        st.session_state.question_start_time = time.time()
         st.rerun()
 
 
@@ -221,16 +313,41 @@ elif st.session_state.phase == "results":
         st.divider()
 
         # ── Rubric dimension scores ──
+        import plotly.graph_objects as go
+
         st.subheader("Rubric breakdown")
         dim_scores = scores.get("scores", {})
         if dim_scores:
+            dims = list(dim_scores.keys())
+            vals = list(dim_scores.values())
+            vals_closed = vals + [vals[0]]
+            dims_closed = dims + [dims[0]]
+
+            fig = go.Figure(go.Scatterpolar(
+                r=vals_closed,
+                theta=dims_closed,
+                fill="toself",
+                fillcolor="rgba(127, 119, 221, 0.2)",
+                line=dict(color="rgba(127, 119, 221, 0.9)", width=2),
+                marker=dict(size=6),
+            ))
+            fig.update_layout(
+                polar=dict(
+                    radialaxis=dict(visible=True, range=[0, 10], tickfont=dict(size=10)),
+                    angularaxis=dict(tickfont=dict(size=12)),
+                ),
+                showlegend=False,
+                margin=dict(t=20, b=20, l=40, r=40),
+                height=350,
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
             cols = st.columns(len(dim_scores))
             for i, (dim, score) in enumerate(dim_scores.items()):
                 with cols[i]:
-                    st.metric(dim, f"{score}/10")
-                    st.progress(score / 10)
-
-        st.divider()
+                    st.metric(dim.split()[0], f"{score}/10")
 
         # ── Per-question breakdown ──
         st.subheader("Question-by-question")
@@ -268,3 +385,12 @@ elif st.session_state.phase == "results":
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()
+
+    pdf_bytes = generate_pdf(scores, domain, difficulty_key)
+    st.download_button(
+    label="📄 Download PDF Report",
+    data=pdf_bytes,
+    file_name=f"interviewsim_{domain.replace(' ','_').lower()}_report.pdf",
+    mime="application/pdf",
+    use_container_width=True,
+)
